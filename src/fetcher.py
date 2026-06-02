@@ -19,6 +19,13 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+# Streamlit Cloud secrets fallback
+try:
+    import streamlit as st
+    if not API_KEY:
+        API_KEY = st.secrets.get("ETHERSCAN_API_KEY", "")
+except Exception:
+    pass
 
 # ── constants ────────────────────────────────────────────────────────────────
 

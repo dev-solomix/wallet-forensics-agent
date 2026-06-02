@@ -211,10 +211,7 @@ def deep_dive_node(state: ForensicState) -> dict:
 def report_node(state: ForensicState) -> dict:
     """
     Calls the Groq LLM to generate the forensic report.
-    Runs for both LOW/MEDIUM wallets (no deep dive) and
-    HIGH-risk wallets (after deep_dive_node has run).
     """
-    # Surface any upstream errors cleanly in the report
     if state.get("error"):
         return {
             "report": f"## Investigation Error\n\n{state['error']}\n\n"
@@ -229,6 +226,15 @@ def report_node(state: ForensicState) -> dict:
         return {"report": "## Error\n\nNo risk assessment data available."}
 
     groq_api_key = os.getenv("GROQ_API_KEY")
+
+    # Streamlit Cloud secrets fallback
+    if not groq_api_key:
+        try:
+            import streamlit as st
+            groq_api_key = st.secrets.get("GROQ_API_KEY", "")
+        except Exception:
+            pass
+
     if not groq_api_key:
         return {
             "report": "## Configuration Error\n\n"
@@ -239,7 +245,7 @@ def report_node(state: ForensicState) -> dict:
     try:
         llm = ChatGroq(
             model="llama-3.3-70b-versatile",
-            temperature=0.1,       # low temp = consistent, precise output
+            temperature=0.1,
             max_tokens=1500,
             api_key=groq_api_key,
         )
