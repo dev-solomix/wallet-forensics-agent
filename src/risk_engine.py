@@ -2,11 +2,9 @@
 risk_engine.py
 --------------
 Extracts seven forensic risk signals from raw wallet data
-produced by fetcher.py, then computes a weighted risk score (0–100).
+produced by fetcher.py, then computes a weighted risk score (0-100).
 
 No LLM involved. Pure deterministic logic.
-This runs BEFORE the LLM so the report node gets structured
-signals rather than raw JSON — cheaper tokens, better output.
 
 Signals computed:
   1. transaction_velocity   — avg transactions per day
@@ -15,7 +13,7 @@ Signals computed:
   4. account_age_days       — days since first ever transaction
   5. round_number_txns      — count of suspiciously round ETH values
   6. incoming_only          — wallet never sends, only receives
-  7. token_diversity        — unique ERC-20 tokens in short timeframe
+  7. token_diversity        — unique ERC-20 tokens interacted with
 """
 
 import time
@@ -23,8 +21,6 @@ from collections import Counter
 
 
 # ── known mixer / tumbler contract addresses ──────────────────────────────────
-# Sources: Chainalysis public reports, OFAC sanctions list (Aug 2022),
-#          community-maintained lists. Lowercase, no checksums.
 
 KNOWN_MIXER_ADDRESSES = {
     # Tornado Cash core contracts (OFAC sanctioned Aug 2022)
@@ -47,30 +43,43 @@ KNOWN_MIXER_ADDRESSES = {
     "0x085fe6e8fc1d851d815ba7e77e7d66b8ab59b42a",
 }
 
-# Round ETH values that commonly appear in structuring / mixing
 ROUND_VALUE_THRESHOLDS = {0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0}
-ROUND_VALUE_TOLERANCE  = 0.0001   # within 0.01% counts as "round"
+ROUND_VALUE_TOLERANCE  = 0.0001
 
-# Thresholds for score weighting (tuned against known-bad wallets)
-VELOCITY_HIGH        = 20    # txns/day above this = high risk
-VELOCITY_MEDIUM      = 5     # txns/day above this = medium risk
-FAN_OUT_HIGH         = 0.90  # 90%+ unique recipients = high risk
+VELOCITY_HIGH        = 20
+VELOCITY_MEDIUM      = 5
+FAN_OUT_HIGH         = 0.90
 FAN_OUT_MEDIUM       = 0.70
-ACCOUNT_AGE_NEW      = 7     # days — very new wallet
-ACCOUNT_AGE_MEDIUM   = 30    # days
-ROUND_TXN_HIGH       = 5     # 5+ round-value txns
+ACCOUNT_AGE_NEW      = 7
+ACCOUNT_AGE_MEDIUM   = 30
+ROUND_TXN_HIGH       = 5
 ROUND_TXN_MEDIUM     = 2
-TOKEN_DIVERSITY_HIGH = 15    # unique tokens
+TOKEN_DIVERSITY_HIGH = 15
 TOKEN_DIVERSITY_MED  = 8
+
+
+# ── FIX 7: age display helper (was missing entirely) ─────────────────────────
+
+def format_age(age_days: float) -> str:
+    """
+    Returns a human-readable age string.
+    Shows years when age >= 365 days, days otherwise.
+
+    Examples:
+        3835.0 days  →  "10.5 years"
+        22.0 days    →  "22 days"
+    """
+    if age_days <= 0:
+        return "Unknown"
+    if age_days >= 365:
+        years = age_days / 365.25
+        return f"{years:.1f} years"
+    return f"{int(age_days)} days"
 
 
 # ── individual signal extractors ──────────────────────────────────────────────
 
 def _compute_velocity(eth_txns: list, token_txns: list) -> dict:
-    """
-    Transactions per day, averaged across the wallet's active lifespan.
-    A wallet doing 20+ txns/day warrants scrutiny.
-    """
     all_txns = eth_txns + token_txns
     if len(all_txns) < 2:
         return {"value": 0.0, "tx_count": len(all_txns), "lifespan_days": 0}
@@ -79,12 +88,9 @@ def _compute_velocity(eth_txns: list, token_txns: list) -> dict:
     if not timestamps:
         return {"value": 0.0, "tx_count": 0, "lifespan_days": 0}
 
-    oldest    = min(timestamps)
-    newest    = max(timestamps)
-    span_secs = newest - oldest
-
-    # Avoid division by zero for wallets with all txns in same block
-    lifespan_days = max(span_secs / 86400, 1)
+    oldest        = min(timestamps)
+    newest        = max(timestamps)
+    lifespan_days = max((newest - oldest) / 86400, 1)
     velocity      = len(all_txns) / lifespan_days
 
     return {
@@ -95,11 +101,6 @@ def _compute_velocity(eth_txns: list, token_txns: list) -> dict:
 
 
 def _compute_fan_out(eth_txns: list) -> dict:
-    """
-    Fan-out ratio = unique outgoing recipients / total outgoing txns.
-    Ratio close to 1.0 means every send goes to a different address —
-    a classic fund-dispersal or structuring pattern.
-    """
     outgoing = [tx for tx in eth_txns if tx.get("direction") == "out"]
     if not outgoing:
         return {"value": 0.0, "unique_recipients": 0, "total_outgoing": 0}
@@ -116,12 +117,8 @@ def _compute_fan_out(eth_txns: list) -> dict:
 
 
 def _compute_mixer_exposure(eth_txns: list, token_txns: list) -> dict:
-    """
-    Check whether any counterparty address is a known mixer contract.
-    Checks both from_address and to_address on every transaction.
-    """
-    flagged_txns   = []
-    flagged_addrs  = set()
+    flagged_txns  = []
+    flagged_addrs = set()
 
     for tx in eth_txns + token_txns:
         hit = None
@@ -133,44 +130,54 @@ def _compute_mixer_exposure(eth_txns: list, token_txns: list) -> dict:
         if hit:
             flagged_addrs.add(hit)
             flagged_txns.append({
-                "hash":            tx.get("hash", ""),
-                "mixer_address":   hit,
-                "direction":       tx.get("direction", ""),
+                "hash":          tx.get("hash", ""),
+                "mixer_address": hit,
+                "direction":     tx.get("direction", ""),
             })
 
     return {
-        "value":          len(flagged_txns),        # 0 = clean
-        "flagged_txns":   flagged_txns[:10],        # cap for LLM context
-        "flagged_addrs":  list(flagged_addrs),
-        "is_exposed":     len(flagged_txns) > 0,
+        "value":         len(flagged_txns),
+        "flagged_txns":  flagged_txns[:10],
+        "flagged_addrs": list(flagged_addrs),
+        "is_exposed":    len(flagged_txns) > 0,
     }
 
 
-def _compute_account_age(eth_txns: list, token_txns: list) -> dict:
+# FIX 8: _compute_account_age now accepts first_tx_timestamp.
+# The old version only used min(timestamps) of the fetched batch,
+# which silently gave wrong results for old high-volume wallets.
+def _compute_account_age(eth_txns: list, token_txns: list,
+                         first_tx_timestamp: int = 0) -> dict:
     """
-    Days between the wallet's first ever transaction and today.
-    Wallets under 7 days old moving meaningful value are suspicious.
+    Days since the wallet's first ever transaction.
+
+    Uses first_tx_timestamp from fetcher when available (dedicated
+    asc-sorted API call). Falls back to min(timestamps) of fetched
+    batch only if the dedicated call failed.
     """
-    all_txns   = eth_txns + token_txns
-    timestamps = [tx["timestamp"] for tx in all_txns if tx["timestamp"] > 0]
+    if first_tx_timestamp and first_tx_timestamp > 0:
+        first_seen = first_tx_timestamp
+    else:
+        all_txns   = eth_txns + token_txns
+        timestamps = [tx["timestamp"] for tx in all_txns if tx["timestamp"] > 0]
+        if not timestamps:
+            return {
+                "value":         0,
+                "display":       "Unknown",
+                "first_seen_ts": None,
+            }
+        first_seen = min(timestamps)
 
-    if not timestamps:
-        return {"value": 0, "first_seen_ts": None}
-
-    first_seen    = min(timestamps)
-    age_days      = (time.time() - first_seen) / 86400
+    age_days = (time.time() - first_seen) / 86400
 
     return {
-        "value":        round(age_days, 1),
+        "value":         round(age_days, 1),
+        "display":       format_age(age_days),   # "10.5 years" or "22 days"
         "first_seen_ts": first_seen,
     }
 
 
 def _compute_round_transactions(eth_txns: list) -> dict:
-    """
-    Count transactions with suspiciously round ETH values.
-    Humans and scripts structuring funds often use clean round numbers.
-    """
     round_txns = []
 
     for tx in eth_txns:
@@ -184,43 +191,32 @@ def _compute_round_transactions(eth_txns: list) -> dict:
                     "value_eth": value,
                     "direction": tx.get("direction", ""),
                 })
-                break   # only count each tx once
+                break
 
     return {
         "value":      len(round_txns),
-        "round_txns": round_txns[:10],  # cap for LLM context
+        "round_txns": round_txns[:10],
     }
 
 
 def _compute_incoming_only(eth_txns: list, token_txns: list) -> dict:
-    """
-    A wallet that only ever receives and never sends is either a
-    cold storage address, a collection address for a scam, or
-    a drop wallet used in layering.
-    """
     all_txns     = eth_txns + token_txns
     has_outgoing = any(tx.get("direction") == "out" for tx in all_txns)
     has_incoming = any(tx.get("direction") == "in"  for tx in all_txns)
 
     return {
-        "value":        not has_outgoing and has_incoming,  # True = flag
+        "value":        not has_outgoing and has_incoming,
         "has_outgoing": has_outgoing,
         "has_incoming": has_incoming,
     }
 
 
 def _compute_token_diversity(token_txns: list) -> dict:
-    """
-    Count unique ERC-20 tokens the wallet has interacted with.
-    Very high token diversity in a short window can indicate
-    automated activity, airdrop farming, or wash trading.
-    """
-    symbols  = [tx.get("token_symbol", "UNKNOWN") for tx in token_txns]
-    counts   = Counter(symbols)
-    unique   = len(counts)
+    symbols = [tx.get("token_symbol", "UNKNOWN") for tx in token_txns]
+    counts  = Counter(symbols)
 
     return {
-        "value":          unique,
+        "value":           len(counts),
         "token_breakdown": dict(counts.most_common(10)),
     }
 
@@ -228,67 +224,48 @@ def _compute_token_diversity(token_txns: list) -> dict:
 # ── scorer ────────────────────────────────────────────────────────────────────
 
 def _compute_score(signals: dict) -> int:
-    """
-    Weighted risk score from 0 (clean) to 100 (high risk).
-
-    Weight allocation (totals to 100):
-      mixer_exposure      35  — hard evidence, heaviest weight
-      fan_out_ratio       20  — structural pattern
-      transaction_velocity 15 — behavioural pattern
-      round_transactions  10  — structuring indicator
-      account_age         10  — new wallet penalty
-      token_diversity      5  — supporting signal
-      incoming_only        5  — supporting signal
-    """
     score = 0
 
-    # ── mixer exposure (0–35) ─────────────────────────────────────────────────
     mixer = signals["mixer_exposure"]["value"]
     if mixer >= 3:
         score += 35
     elif mixer >= 1:
         score += 20
 
-    # ── fan-out ratio (0–20) ──────────────────────────────────────────────────
     fan_out = signals["fan_out_ratio"]["value"]
     if fan_out >= FAN_OUT_HIGH:
         score += 20
     elif fan_out >= FAN_OUT_MEDIUM:
         score += 10
 
-    # ── transaction velocity (0–15) ───────────────────────────────────────────
     velocity = signals["transaction_velocity"]["value"]
     if velocity >= VELOCITY_HIGH:
         score += 15
     elif velocity >= VELOCITY_MEDIUM:
         score += 7
 
-    # ── round transactions (0–10) ─────────────────────────────────────────────
     round_count = signals["round_transactions"]["value"]
     if round_count >= ROUND_TXN_HIGH:
         score += 10
     elif round_count >= ROUND_TXN_MEDIUM:
         score += 5
 
-    # ── account age (0–10) ────────────────────────────────────────────────────
     age = signals["account_age_days"]["value"]
     if 0 < age <= ACCOUNT_AGE_NEW:
         score += 10
     elif age <= ACCOUNT_AGE_MEDIUM:
         score += 5
 
-    # ── token diversity (0–5) ─────────────────────────────────────────────────
     diversity = signals["token_diversity"]["value"]
     if diversity >= TOKEN_DIVERSITY_HIGH:
         score += 5
     elif diversity >= TOKEN_DIVERSITY_MED:
         score += 2
 
-    # ── incoming only (0–5) ───────────────────────────────────────────────────
     if signals["incoming_only"]["value"]:
         score += 5
 
-    return min(score, 100)   # cap at 100
+    return min(score, 100)
 
 
 def _risk_label(score: int) -> str:
@@ -305,39 +282,22 @@ def extract_risk_signals(wallet_data: dict) -> dict:
     """
     Master function. Takes the dict returned by fetch_wallet_data()
     and returns a complete risk assessment.
-
-    This is the only function agent.py needs to import from this module.
-
-    Returns:
-        {
-          "address":              str,
-          "risk_score":           int,       # 0–100
-          "risk_label":           str,       # LOW / MEDIUM / HIGH
-          "signals": {
-            "transaction_velocity": {...},
-            "fan_out_ratio":        {...},
-            "mixer_exposure":       {...},
-            "account_age_days":     {...},
-            "round_transactions":   {...},
-            "incoming_only":        {...},
-            "token_diversity":      {...},
-          },
-          "top_flags":            list[str], # human-readable findings
-          "metadata": {
-            "eth_balance":         float,
-            "total_tx_analysed":   int,
-          }
-        }
     """
-    eth_txns   = wallet_data.get("eth_transactions", [])
-    token_txns = wallet_data.get("token_transfers",  [])
-    address    = wallet_data.get("address", "unknown")
+    eth_txns           = wallet_data.get("eth_transactions", [])
+    token_txns         = wallet_data.get("token_transfers",  [])
+    address            = wallet_data.get("address", "unknown")
+    # FIX 9: read first_tx_timestamp from wallet_data and pass it through
+    first_tx_timestamp = wallet_data.get("first_tx_timestamp", 0)
 
     signals = {
         "transaction_velocity": _compute_velocity(eth_txns, token_txns),
         "fan_out_ratio":        _compute_fan_out(eth_txns),
         "mixer_exposure":       _compute_mixer_exposure(eth_txns, token_txns),
-        "account_age_days":     _compute_account_age(eth_txns, token_txns),
+        "account_age_days":     _compute_account_age(
+                                    eth_txns,
+                                    token_txns,
+                                    first_tx_timestamp=first_tx_timestamp,
+                                ),
         "round_transactions":   _compute_round_transactions(eth_txns),
         "incoming_only":        _compute_incoming_only(eth_txns, token_txns),
         "token_diversity":      _compute_token_diversity(token_txns),
@@ -345,16 +305,14 @@ def extract_risk_signals(wallet_data: dict) -> dict:
 
     score = _compute_score(signals)
     label = _risk_label(score)
-
-    # Build a plain-English list of triggered flags for the LLM prompt
-    top_flags = _build_flags(signals, score)
+    flags = _build_flags(signals, score)
 
     return {
         "address":    address,
         "risk_score": score,
         "risk_label": label,
         "signals":    signals,
-        "top_flags":  top_flags,
+        "top_flags":  flags,
         "metadata": {
             "eth_balance":       wallet_data.get("balance_eth", 0.0),
             "total_tx_analysed": wallet_data.get("total_tx_count", 0),
@@ -363,10 +321,6 @@ def extract_risk_signals(wallet_data: dict) -> dict:
 
 
 def _build_flags(signals: dict, score: int) -> list:
-    """
-    Convert triggered signal thresholds into plain-English flag strings.
-    These are passed directly into the LLM forensic prompt.
-    """
     flags = []
 
     mixer = signals["mixer_exposure"]
@@ -394,8 +348,10 @@ def _build_flags(signals: dict, score: int) -> list:
 
     age = signals["account_age_days"]
     if 0 < age["value"] <= ACCOUNT_AGE_MEDIUM:
+        # FIX 10: use age["display"] not age["value"] — shows "22 days"
+        # not "22.0", and shows "1.2 years" not "438.0" for older wallets
         flags.append(
-            f"Young wallet: first seen {age['value']:.0f} days ago"
+            f"Young wallet: first seen {age['display']} ago"
         )
 
     rounds = signals["round_transactions"]
@@ -425,45 +381,33 @@ def _build_flags(signals: dict, score: int) -> list:
 
 
 # ── quick test ────────────────────────────────────────────────────────────────
-# Runs without an API call — uses synthetic data so you can test the
-# scoring logic without needing a live Etherscan key.
-#
-#   python src/risk_engine.py
+# python src/risk_engine.py
 
 if __name__ == "__main__":
 
-    print("\nRisk engine — synthetic data test")
+    print("\nRisk engine — synthetic data self-test")
     print("-" * 60)
-
-    # Simulate a suspicious wallet:
-    # - 80 outgoing txns, all to different addresses (high fan-out)
-    # - several round-number ETH values
-    # - interaction with a Tornado Cash address
-    # - wallet only 3 days old
 
     now = int(time.time())
 
     synthetic_eth_txns = []
-
-    # 80 outgoing to unique addresses
     for i in range(80):
         synthetic_eth_txns.append({
             "hash":         f"0xabc{i:04x}",
-            "timestamp":    now - (i * 300),          # every 5 min
+            "timestamp":    now - (i * 300),
             "from_address": "0xtargetwalletaddress",
             "to_address":   f"0xunique_recipient_{i:04x}",
-            "value_eth":    1.0 if i % 10 == 0 else 0.037,  # some round
+            "value_eth":    1.0 if i % 10 == 0 else 0.037,
             "direction":    "out",
             "block_number": 19000000 - i,
             "is_error":     False,
             "gas_used":     21000,
         })
 
-    # 1 incoming from Tornado Cash
     synthetic_eth_txns.append({
         "hash":         "0xmixerhash001",
         "timestamp":    now - 86400,
-        "from_address": "0xd90e2f925da726b50c4ed8d0fb90ad053324f31b",  # TC 1 ETH
+        "from_address": "0xd90e2f925da726b50c4ed8d0fb90ad053324f31b",
         "to_address":   "0xtargetwalletaddress",
         "value_eth":    10.0,
         "direction":    "in",
@@ -484,34 +428,42 @@ if __name__ == "__main__":
             "direction":        "out",
             "contract_address": f"0xcontract{i}",
         }
-        for i in range(20)   # 20 unique tokens
+        for i in range(20)
     ]
 
+    # Simulate 3-day-old wallet via first_tx_timestamp
+    first_tx_timestamp = now - (3 * 86400)
+
     synthetic_wallet = {
-        "address":          "0xtargetwalletaddress",
-        "balance_eth":      4.2,
-        "eth_transactions": synthetic_eth_txns,
-        "token_transfers":  synthetic_token_txns,
-        "fetch_errors":     [],
-        "total_tx_count":   len(synthetic_eth_txns) + len(synthetic_token_txns),
+        "address":            "0xtargetwalletaddress",
+        "balance_eth":        4.2,
+        "first_tx_timestamp": first_tx_timestamp,
+        "eth_transactions":   synthetic_eth_txns,
+        "token_transfers":    synthetic_token_txns,
+        "fetch_errors":       [],
+        "total_tx_count":     len(synthetic_eth_txns) + len(synthetic_token_txns),
     }
 
     result = extract_risk_signals(synthetic_wallet)
 
-    print(f"  Address:      {result['address']}")
-    print(f"  Risk score:   {result['risk_score']} / 100")
-    print(f"  Risk label:   {result['risk_label']}")
-    print(f"  ETH balance:  {result['metadata']['eth_balance']} ETH")
-    print(f"  Txns analysed:{result['metadata']['total_tx_analysed']}")
+    print(f"  Risk score:    {result['risk_score']} / 100")
+    print(f"  Risk label:    {result['risk_label']}")
 
     print("\n  Signals:")
     for name, sig in result["signals"].items():
-        print(f"    {name:<28} {sig['value']}")
+        display = sig.get("display", sig["value"])
+        print(f"    {name:<28} {display}")
 
     print("\n  Flags raised:")
     for flag in result["top_flags"]:
         print(f"    - {flag}")
 
-    expected_high = result["risk_label"] == "HIGH"
-    print(f"\n  [{'OK' if expected_high else 'FAIL'}] "
-          f"Expected HIGH risk — got {result['risk_label']}\n")
+    # Age display tests
+    print("\n  Age display tests:")
+    print(f"    10.5 years:  {format_age(10.5 * 365.25)}")
+    print(f"    22 days:     {format_age(22)}")
+    print(f"    364 days:    {format_age(364)}")
+    print(f"    365 days:    {format_age(365)}")
+
+    ok = result["risk_label"] == "HIGH"
+    print(f"\n  [{'OK' if ok else 'FAIL'}] Expected HIGH — got {result['risk_label']}\n")

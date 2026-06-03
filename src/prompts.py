@@ -2,10 +2,7 @@
 prompts.py
 ----------
 All LLM prompt templates for the forensic report node.
-Kept separate from agent.py so prompts can be tuned
-without touching agent logic.
 """
-
 
 SYSTEM_PROMPT = """You are a senior blockchain forensic analyst supporting \
 law enforcement and financial crime investigations. Your job is to produce \
@@ -20,28 +17,25 @@ Rules you must follow:
 
 
 def build_report_prompt(risk_assessment: dict, wallet_data: dict,
-                        deep_dive: dict | None = None) -> str:
+                        deep_dive: dict = None) -> str:
     """
     Builds the user-turn prompt sent to the LLM report node.
-    Injects risk signals and the most suspicious transactions —
-    NOT the full 100-tx dump (would bloat context and degrade output).
     """
-    address    = risk_assessment["address"]
-    score      = risk_assessment["risk_score"]
-    label      = risk_assessment["risk_label"]
-    flags      = risk_assessment["top_flags"]
-    signals    = risk_assessment["signals"]
-    balance    = risk_assessment["metadata"]["eth_balance"]
-    tx_count   = risk_assessment["metadata"]["total_tx_analysed"]
+    address  = risk_assessment["address"]
+    score    = risk_assessment["risk_score"]
+    label    = risk_assessment["risk_label"]
+    flags    = risk_assessment["top_flags"]
+    signals  = risk_assessment["signals"]
+    balance  = risk_assessment["metadata"]["eth_balance"]
+    tx_count = risk_assessment["metadata"]["total_tx_analysed"]
 
-    # Pull the 8 highest-value ETH transactions for evidence
+    # Top 8 highest-value ETH transactions for evidence
     eth_txns = sorted(
         wallet_data.get("eth_transactions", []),
         key=lambda x: x.get("value_eth", 0),
         reverse=True
     )[:8]
 
-    # Format transactions as a compact evidence block
     tx_lines = []
     for tx in eth_txns:
         tx_lines.append(
@@ -53,7 +47,6 @@ def build_report_prompt(risk_assessment: dict, wallet_data: dict,
         )
     tx_block = "\n".join(tx_lines) if tx_lines else "  No ETH transactions found."
 
-    # Format mixer-flagged transactions if any
     mixer_txns  = signals["mixer_exposure"].get("flagged_txns", [])
     mixer_lines = []
     for mx in mixer_txns[:5]:
@@ -63,22 +56,24 @@ def build_report_prompt(risk_assessment: dict, wallet_data: dict,
             f"hash: {mx['hash'][:20]}..."
         )
     mixer_block = (
-        "\n".join(mixer_lines)
-        if mixer_lines
-        else "  None detected."
+        "\n".join(mixer_lines) if mixer_lines else "  None detected."
     )
 
-    # Deep-dive block (only present for HIGH-risk wallets)
     deep_dive_block = ""
     if deep_dive and deep_dive.get("neighbour_summaries"):
         lines = ["\nONE-HOP NEIGHBOUR ANALYSIS (top flagged counterparties):"]
-        for neighbour in deep_dive["neighbour_summaries"]:
+        for nb in deep_dive["neighbour_summaries"]:
             lines.append(
-                f"  Address: {neighbour['address']}\n"
-                f"  Txns fetched: {neighbour['tx_count']}\n"
-                f"  Onward destinations: {neighbour['unique_destinations']}\n"
+                f"  Address: {nb['address']}\n"
+                f"  Txns fetched: {nb['tx_count']}\n"
+                f"  Onward destinations: {nb['unique_destinations']}\n"
             )
         deep_dive_block = "\n".join(lines)
+
+    # Use the display-formatted age (e.g. "10.5 years" or "22 days")
+    age_display = signals["account_age_days"].get(
+        "display", f"{signals['account_age_days']['value']:.0f} days"
+    )
 
     prompt = f"""Produce a forensic risk report for the following wallet.
 
@@ -95,7 +90,7 @@ RISK SIGNALS
 Transaction velocity:  {signals['transaction_velocity']['value']} txns/day
 Fan-out ratio:         {signals['fan_out_ratio']['value']:.2%} unique recipients
 Mixer interactions:    {signals['mixer_exposure']['value']} flagged transactions
-Account age:           {signals['account_age_days']['value']} days
+Account age:           {age_display}
 Round-value txns:      {signals['round_transactions']['value']} detected
 Incoming only:         {signals['incoming_only']['value']}
 Token diversity:       {signals['token_diversity']['value']} unique ERC-20s
@@ -115,7 +110,7 @@ MIXER / SANCTIONS INTERACTIONS
 
 REQUIRED OUTPUT FORMAT
 ----------------------
-Produce exactly these five sections, using these exact headings:
+Produce exactly these five sections with these exact headings:
 
 ## Executive Summary
 2-3 sentences. State what this wallet appears to be doing and the \

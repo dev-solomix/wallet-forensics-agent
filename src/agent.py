@@ -27,6 +27,14 @@ Graph structure:
 """
 
 import os
+import sys
+
+# FIX 1: ensures 'src' is importable whether running via:
+#   - Streamlit Cloud       (cwd = project root)
+#   - python src/agent.py  (cwd = project root, but sys.path lacks it)
+#   - Windows PowerShell   (PYTHONPATH not set)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from typing import TypedDict
 from dotenv import load_dotenv
 
@@ -49,12 +57,12 @@ class ForensicState(TypedDict):
     Each node reads from it and writes back to it.
     LangGraph merges return dicts — only return keys you're updating.
     """
-    address:         str          # wallet address under investigation
-    wallet_data:     dict         # raw output from fetcher.py
-    risk_assessment: dict         # scored output from risk_engine.py
-    deep_dive:       dict         # one-hop neighbour data (HIGH risk only)
-    report:          str          # final LLM-generated forensic report
-    error:           str          # any fatal error message
+    address:         str
+    wallet_data:     dict
+    risk_assessment: dict
+    deep_dive:       dict
+    report:          str
+    error:           str
 
 
 # ── node 1: fetch ─────────────────────────────────────────────────────────────
@@ -62,8 +70,6 @@ class ForensicState(TypedDict):
 def fetch_node(state: ForensicState) -> dict:
     """
     Calls the Etherscan fetcher and writes raw wallet data to state.
-    Isolated here so if the API fails, the error is caught cleanly
-    and the graph can terminate gracefully.
     """
     try:
         wallet_data = fetch_wallet_data(state["address"])
@@ -81,7 +87,6 @@ def analyze_node(state: ForensicState) -> dict:
     """
     Runs the deterministic risk engine on the fetched wallet data.
     No API calls — pure Python computation.
-    Skips gracefully if fetch_node reported an error.
     """
     if state.get("error"):
         return {"risk_assessment": {}}
@@ -107,15 +112,13 @@ def analyze_node(state: ForensicState) -> dict:
 def risk_router(state: ForensicState) -> str:
     """
     Decides the next node based on risk score.
-    Returns a string key that LangGraph maps to the next node.
 
-      score >= 50  →  "deep_dive"   (investigate further before reporting)
-      score <  50  →  "report"      (go straight to report generation)
-      any error    →  "report"      (report will surface the error)
+      score >= 50  →  "deep_dive"
+      score <  50  →  "report"
+      any error    →  "report"
     """
     if state.get("error"):
         return "report"
-
     score = state.get("risk_assessment", {}).get("risk_score", 0)
     return "deep_dive" if score >= 50 else "report"
 
@@ -125,12 +128,8 @@ def risk_router(state: ForensicState) -> str:
 def deep_dive_node(state: ForensicState) -> dict:
     """
     For HIGH-risk wallets only.
-    Takes the top 3 flagged counterparty addresses and fetches
-    one additional hop of their transaction data — i.e. where
-    did the money go NEXT after leaving the target wallet.
-
-    This is what separates a basic wallet checker from a real
-    investigative tool: it follows the money one step further.
+    Fetches one additional hop of transaction data from the top 3
+    flagged counterparty addresses — follows the money one step further.
     """
     deep_dive = {
         "neighbour_summaries": [],
@@ -141,20 +140,19 @@ def deep_dive_node(state: ForensicState) -> dict:
     signals         = risk_assessment.get("signals", {})
     eth_txns        = state.get("wallet_data", {}).get("eth_transactions", [])
 
-    # Collect the top 3 outgoing counterparties by value
+    # Top 3 outgoing counterparties by value
     outgoing = [tx for tx in eth_txns if tx.get("direction") == "out"]
     outgoing_sorted = sorted(
         outgoing, key=lambda x: x.get("value_eth", 0), reverse=True
     )
 
-    # Also include any mixer-flagged addresses
     mixer_addrs = set(
         signals.get("mixer_exposure", {}).get("flagged_addrs", [])
     )
 
-    # Combine: top value recipients + mixer addresses, deduplicated, max 3
     priority_addrs = []
     seen = set()
+
     for tx in outgoing_sorted:
         addr = tx.get("to_address", "")
         if addr and addr not in seen:
@@ -169,14 +167,12 @@ def deep_dive_node(state: ForensicState) -> dict:
             priority_addrs.insert(0, addr)
             seen.add(addr)
 
-    priority_addrs = priority_addrs[:3]   # hard cap at 3 (API rate limit)
+    priority_addrs = priority_addrs[:3]
 
     for neighbour_addr in priority_addrs:
         try:
-            neighbour_txns = fetch_eth_transactions(neighbour_addr, limit=20)
-
-            # Summarise where this address sent funds next
-            onward = [
+            neighbour_txns      = fetch_eth_transactions(neighbour_addr, limit=20)
+            onward              = [
                 tx["to_address"]
                 for tx in neighbour_txns
                 if tx.get("direction") == "out"
@@ -197,7 +193,6 @@ def deep_dive_node(state: ForensicState) -> dict:
                 ],
             })
         except RuntimeError:
-            # Non-fatal: if a neighbour fetch fails, skip it and continue
             deep_dive["neighbour_summaries"].append({
                 "address": neighbour_addr,
                 "error":   "Could not fetch neighbour data",
@@ -225,9 +220,9 @@ def report_node(state: ForensicState) -> dict:
     if not risk_assessment:
         return {"report": "## Error\n\nNo risk assessment data available."}
 
+    # FIX 2: get key from env first, then Streamlit secrets — never reversed
     groq_api_key = os.getenv("GROQ_API_KEY")
 
-    # Streamlit Cloud secrets fallback
     if not groq_api_key:
         try:
             import streamlit as st
@@ -281,23 +276,17 @@ def report_node(state: ForensicState) -> dict:
 def build_graph():
     """
     Assembles and compiles the LangGraph StateGraph.
-    Returns a compiled graph ready to invoke.
     """
     graph = StateGraph(ForensicState)
 
-    # Register nodes
     graph.add_node("fetch",     fetch_node)
     graph.add_node("analyze",   analyze_node)
     graph.add_node("deep_dive", deep_dive_node)
     graph.add_node("report",    report_node)
 
-    # Entry point
     graph.set_entry_point("fetch")
+    graph.add_edge("fetch", "analyze")
 
-    # Linear edges
-    graph.add_edge("fetch",   "analyze")
-
-    # Conditional edge after analyze
     graph.add_conditional_edges(
         "analyze",
         risk_router,
@@ -307,10 +296,7 @@ def build_graph():
         }
     )
 
-    # Deep dive always flows into report
     graph.add_edge("deep_dive", "report")
-
-    # Report is the terminal node
     graph.add_edge("report", END)
 
     return graph.compile()
@@ -318,16 +304,13 @@ def build_graph():
 
 # ── public API ────────────────────────────────────────────────────────────────
 
-# Compile once at import time — reused across all Streamlit calls
+# Compiled once at import time — reused across all Streamlit calls
 forensic_agent = build_graph()
 
 
 def run_investigation(address: str) -> dict:
     """
-    Single entry point for app.py and any other caller.
-
-    Args:
-        address: Ethereum wallet address (0x...)
+    Single entry point for app.py.
 
     Returns the final ForensicState dict containing:
         - risk_assessment  (score, label, signals, flags)
@@ -347,20 +330,16 @@ def run_investigation(address: str) -> dict:
     return forensic_agent.invoke(initial_state)
 
 
-# ── quick test (no API keys needed for graph structure test) ──────────────────
-# Tests that the graph compiles and routes correctly using mock nodes.
-#
-#   python src/agent.py
+# ── quick test ────────────────────────────────────────────────────────────────
+# python src/agent.py
 
 if __name__ == "__main__":
     print("\nAgent graph structure test")
     print("-" * 60)
 
-    # Verify graph compiled
     graph = build_graph()
     print("  [OK] Graph compiled successfully")
 
-    # Verify nodes are registered
     expected_nodes = {"fetch", "analyze", "deep_dive", "report"}
     actual_nodes   = set(graph.get_graph().nodes.keys()) - {"__start__", "__end__"}
     missing        = expected_nodes - actual_nodes
@@ -370,14 +349,13 @@ if __name__ == "__main__":
     else:
         print(f"  [OK] All nodes registered: {sorted(actual_nodes)}")
 
-    # Verify conditional routing logic directly
     mock_high = {"risk_assessment": {"risk_score": 75}, "error": ""}
     mock_low  = {"risk_assessment": {"risk_score": 30}, "error": ""}
     mock_err  = {"risk_assessment": {},                  "error": "API failed"}
 
-    assert risk_router(mock_high) == "deep_dive", "HIGH score should route to deep_dive"
-    assert risk_router(mock_low)  == "report",    "LOW score should route to report"
-    assert risk_router(mock_err)  == "report",    "Errors should route to report"
+    assert risk_router(mock_high) == "deep_dive"
+    assert risk_router(mock_low)  == "report"
+    assert risk_router(mock_err)  == "report"
     print("  [OK] Conditional routing correct (high→deep_dive, low→report, error→report)")
 
     print("\n  Graph is ready. To run a live investigation:")
